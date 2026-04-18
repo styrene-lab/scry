@@ -1,0 +1,19 @@
+/target
+**/target
+
+# Model files — too large for git
+*.safetensors
+*.gguf
+*.ckpt
+*.pth
+*.bin
+
+# Generated images
+output/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
