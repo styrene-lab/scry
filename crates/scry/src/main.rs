@@ -47,7 +47,37 @@ impl Extension for ScryExtension {
 
     async fn handle_rpc(&self, method: &str, params: Value) -> Result<Value> {
         match method {
-            "get_tools" => Ok(tools::tool_definitions()),
+            // ── v2 handshake ──
+            "initialize" => {
+                Ok(serde_json::json!({
+                    "protocol_version": 2,
+                    "extension_info": {
+                        "name": self.name(),
+                        "version": self.version(),
+                        "sdk_version": "0.16.0"
+                    },
+                    "capabilities": {
+                        "tools": true, "widgets": true, "mind": false,
+                        "vox": false, "resources": false, "prompts": false,
+                        "sampling": false, "elicitation": false, "streaming": true
+                    },
+                    "tools": tools::tool_definitions()
+                }))
+            }
+
+            // ── v2 tool dispatch ──
+            "tools/call" => {
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let args = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                dispatch_tool(name, args, &self.pipeline).await
+            }
+            "execute_tool" => {
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let args = params.get("args").cloned().unwrap_or(serde_json::json!({}));
+                dispatch_tool(name, args, &self.pipeline).await
+            }
+
+            "get_tools" | "tools/list" => Ok(tools::tool_definitions()),
             m if m.starts_with("execute_") => {
                 let tool_name = &m["execute_".len()..];
                 dispatch_tool(tool_name, params, &self.pipeline).await
@@ -86,6 +116,9 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    let args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).map(|s| s.as_str());
 
     // ~/.scry/models/ is our canonical location. HF cache, ComfyUI, A1111 are auto-discovered.
     // SCRY_EXTRA_MODEL_DIRS adds more paths (colon-separated).
@@ -152,7 +185,34 @@ async fn main() {
         Err(e) => tracing::warn!(err = %e, "model scan failed"),
     }
 
-    omegon_extension::serve(ext)
-        .await
-        .expect("scry extension serve loop failed");
+    let result = match mode {
+        Some("--mcp") => {
+            // MCP server mode — compatible with Claude Code, Cursor, etc.
+            omegon_extension::mcp_shim::serve_mcp(ext).await
+        }
+        Some("--help") | Some("help") | Some("-h") => {
+            println!("scry — agentic local image generation for omegon");
+            println!();
+            println!("USAGE:");
+            println!("  scry                Run as omegon extension (default, v2 protocol)");
+            println!("  scry --rpc          Run as omegon extension (explicit)");
+            println!("  scry --mcp          Run as MCP server (Claude Code, Cursor, etc.)");
+            println!("  scry --help         Show this help");
+            println!();
+            println!("ENVIRONMENT:");
+            println!("  COMFYUI_URL         ComfyUI server URL (default: http://127.0.0.1:8188)");
+            println!("  SCRY_MODELS_DIR     Model directory (default: ~/.scry/models)");
+            println!("  SCRY_OUTPUT_DIR     Output directory (default: ~/.scry/output)");
+            return;
+        }
+        Some("--rpc") | _ => {
+            // Default: omegon extension (v2 bidirectional protocol)
+            omegon_extension::serve_v2(ext).await
+        }
+    };
+
+    if let Err(e) = result {
+        tracing::error!("scry serve failed: {e}");
+        std::process::exit(1);
+    }
 }
