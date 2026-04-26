@@ -14,27 +14,44 @@ SCRY_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="${HOME}/.scry/venv"
 MODELS_DIR="${HOME}/.scry/models"
 
-# ── Find compatible Python ─────────────────────────────────────────
+# ── Ensure cargo is on PATH ───────────────────────────────────────
+if ! command -v cargo &>/dev/null && [ -x "${HOME}/.cargo/bin/cargo" ]; then
+    export PATH="${HOME}/.cargo/bin:${PATH}"
+fi
+
+if ! command -v cargo &>/dev/null; then
+    echo "ERROR: cargo not found. Install Rust: https://rustup.rs"
+    echo "  macOS (nex):       nex install rustup"
+    echo "  macOS (Homebrew):  brew install rustup && rustup-init"
+    echo "  Linux:             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    echo ""
+    echo "  After installing, make sure ~/.cargo/bin is in your PATH."
+    exit 1
+fi
+
+# ── Find compatible Python (>= 3.10) ──────────────────────────────
+python_version_ok() {
+    "$1" -c 'import sys; exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null
+}
+
 find_python() {
-    for candidate in python3.12 python3.11 python3.10; do
-        if command -v "$candidate" &>/dev/null; then
+    # Prefer explicitly-versioned binaries (highest first), then bare python3
+    for candidate in python3.12 python3.11 python3.10 python3.13 python3; do
+        if command -v "$candidate" &>/dev/null && python_version_ok "$candidate"; then
             echo "$candidate"
             return
         fi
     done
-    local ver
-    ver="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
-    case "$ver" in
-        3.10|3.11|3.12) echo "python3"; return ;;
-    esac
     echo ""
 }
 
 PYTHON_BIN="${SCRY_PYTHON:-$(find_python)}"
 if [ -z "$PYTHON_BIN" ]; then
-    echo "ERROR: No compatible Python found (need 3.10–3.12)."
+    echo "ERROR: No compatible Python found (need >= 3.10)."
     echo "  Available: $(python3 --version 2>&1 || echo 'none')"
-    echo "  Install Python 3.12: brew install python@3.12"
+    echo "  Install Python 3.12:"
+    echo "    nex:       nex install python312"
+    echo "    Homebrew:  brew install python@3.12"
     exit 1
 fi
 echo "==> Using Python: $PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
@@ -45,7 +62,23 @@ cargo build --release --manifest-path "${SCRY_DIR}/Cargo.toml"
 
 # ── Python venv ─────────────────────────────────────────────────────
 VENV_PYTHON="${VENV_DIR}/bin/python"
-if [ ! -x "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -c "import torch" &>/dev/null; then
+recreate_venv=false
+if [ ! -x "$VENV_PYTHON" ]; then
+    recreate_venv=true
+elif ! "$VENV_PYTHON" -c "import sys" &>/dev/null; then
+    # venv python is broken (e.g. system python was upgraded/removed)
+    recreate_venv=true
+else
+    # Recreate if the base python major.minor changed
+    venv_ver="$("$VENV_PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "")"
+    base_ver="$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "")"
+    if [ "$venv_ver" != "$base_ver" ]; then
+        echo "==> Python version changed ($venv_ver -> $base_ver), recreating venv..."
+        recreate_venv=true
+    fi
+fi
+
+if [ "$recreate_venv" = true ]; then
     echo "==> Creating Python venv at ${VENV_DIR}..."
     rm -rf "${VENV_DIR}"
     "$PYTHON_BIN" -m venv "${VENV_DIR}"

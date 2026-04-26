@@ -7,12 +7,14 @@ use tracing::{info, warn};
 use crate::backend::Backend;
 use crate::params::{GenerateParams, GenerationResult, Img2ImgParams, UpscaleParams};
 use crate::registry::{ModelKind, ModelRegistry};
+use crate::store::{ArtifactMeta, ArtifactStore, MetaBuilder};
 use crate::{Error, Result};
 
 pub struct Pipeline {
     registry: RwLock<ModelRegistry>,
     backends: Vec<BackendSlot>,
     output_dir: PathBuf,
+    store: ArtifactStore,
 }
 
 struct BackendSlot {
@@ -25,19 +27,30 @@ impl Pipeline {
     ///
     /// `extra_model_dirs` — additional directories to scan beyond the auto-discovered
     /// HuggingFace cache, ComfyUI, and A1111 locations.
-    pub fn new(extra_model_dirs: &[PathBuf], output_dir: PathBuf) -> Self {
+    /// `artifacts_dir` — root for the content-addressed artifact store.
+    pub fn new(extra_model_dirs: &[PathBuf], output_dir: PathBuf, artifacts_dir: PathBuf) -> Self {
         Self {
             registry: RwLock::new(ModelRegistry::new(extra_model_dirs)),
             backends: Vec::new(),
             output_dir,
+            store: ArtifactStore::new(artifacts_dir),
         }
+    }
+
+    pub fn store(&self) -> &ArtifactStore {
+        &self.store
+    }
+
+    /// Look up an artifact by sha256 hex.
+    pub fn get_artifact(&self, id: &str) -> Result<(PathBuf, ArtifactMeta)> {
+        self.store.get(id)
     }
 
     pub fn add_backend(&mut self, backend: Box<dyn Backend>) {
         info!(name = backend.name(), "registered backend");
         self.backends.push(BackendSlot {
             backend,
-            healthy: AtomicBool::new(true),
+            healthy: AtomicBool::new(false),
         });
     }
 
@@ -60,7 +73,15 @@ impl Pipeline {
         params.model = resolved_model;
 
         let backend = self.select_backend(arch).await?;
-        backend.generate(&params).await
+        let mut result = backend.generate(&params).await?;
+        let params_json = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        self.attach_artifacts(
+            &mut result,
+            "generate",
+            Some(params.prompt.clone()),
+            params_json,
+        );
+        Ok(result)
     }
 
     pub async fn img2img(&self, mut params: Img2ImgParams) -> Result<GenerationResult> {
@@ -68,11 +89,25 @@ impl Pipeline {
             params.base.output_dir = Some(self.output_dir.clone());
         }
 
+        // Accept `scry://artifact/<sha>` for input_image, in addition to plain paths.
+        let resolved_input = self
+            .store
+            .resolve(&params.input_image.to_string_lossy())?;
+        params.input_image = resolved_input;
+
         let (resolved_model, arch) = self.resolve_model(&params.base.model).await;
         params.base.model = resolved_model;
 
         let backend = self.select_backend(arch).await?;
-        backend.img2img(&params).await
+        let mut result = backend.img2img(&params).await?;
+        let params_json = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        self.attach_artifacts(
+            &mut result,
+            "refine",
+            Some(params.base.prompt.clone()),
+            params_json,
+        );
+        Ok(result)
     }
 
     pub async fn upscale(&self, mut params: UpscaleParams) -> Result<GenerationResult> {
@@ -80,8 +115,48 @@ impl Pipeline {
             params.output_dir = Some(self.output_dir.clone());
         }
 
+        let resolved_input = self
+            .store
+            .resolve(&params.input_image.to_string_lossy())?;
+        params.input_image = resolved_input;
+
         let backend = self.select_backend(None).await?;
-        backend.upscale(&params).await
+        let mut result = backend.upscale(&params).await?;
+        let params_json = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        self.attach_artifacts(&mut result, "upscale", None, params_json);
+        Ok(result)
+    }
+
+    /// Hash and copy each generated image into the artifact store, populating
+    /// `result.artifacts` index-aligned with `result.images`. A failure on a
+    /// single artifact is logged and skipped — generation already succeeded and
+    /// returning the path-only result is still useful to local clients.
+    fn attach_artifacts(
+        &self,
+        result: &mut GenerationResult,
+        source_tool: &str,
+        prompt: Option<String>,
+        params_json: serde_json::Value,
+    ) {
+        for path in &result.images {
+            if !path.exists() {
+                // ComfyUI returns bare filenames; nothing to ingest from this side.
+                continue;
+            }
+            let meta = MetaBuilder {
+                source_tool,
+                model: Some(result.model.clone()),
+                seed: Some(result.seed),
+                prompt: prompt.clone(),
+                params: params_json.clone(),
+            };
+            match self.store.ingest_file(path, meta) {
+                Ok(art) => result.artifacts.push(art),
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "artifact ingest failed");
+                }
+            }
+        }
     }
 
     /// Resolve a model name against the registry.

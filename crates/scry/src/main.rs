@@ -1,23 +1,38 @@
 mod tools;
 
-use scry_engine::{ComfyUiBackend, DiffusersBackend, Pipeline};
+use scry_engine::{ComfyUiBackend, DiffusersBackend, Pipeline, SecretStore};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use omegon_extension::{Extension, Result};
 use serde_json::Value;
-use tracing::info;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 use crate::tools::dispatch_tool;
 
+/// Secret names scry knows how to consume. Anything else delivered via
+/// bootstrap_secrets is accepted and forwarded to the worker too — this list
+/// just documents intent and seeds the --mcp env-var fallback.
+const KNOWN_SECRETS: &[&str] = &["HF_TOKEN", "CIVITAI_TOKEN"];
+
 pub struct ScryExtension {
     pipeline: Arc<Pipeline>,
+    secrets: SecretStore,
 }
 
 impl ScryExtension {
-    pub fn new(extra_model_dirs: Vec<PathBuf>, output_dir: PathBuf, worker_script: PathBuf, python_bin: String) -> Self {
-        let mut pipeline = Pipeline::new(&extra_model_dirs, output_dir.clone());
+    pub fn new(
+        extra_model_dirs: Vec<PathBuf>,
+        output_dir: PathBuf,
+        artifacts_dir: PathBuf,
+        worker_script: PathBuf,
+        python_bin: String,
+        secrets: SecretStore,
+    ) -> Self {
+        let mut pipeline = Pipeline::new(&extra_model_dirs, output_dir.clone(), artifacts_dir);
 
         // ComfyUI backend — tried first, gracefully absent if not running.
         let comfyui_url = std::env::var("COMFYUI_URL")
@@ -25,12 +40,14 @@ impl ScryExtension {
         let comfyui = ComfyUiBackend::new(comfyui_url, output_dir);
         pipeline.add_backend(Box::new(comfyui));
 
-        // Diffusers backend — always available as fallback.
-        let diffusers = DiffusersBackend::new(worker_script, python_bin);
+        // Diffusers backend — always available as fallback. Shares the secret
+        // store so worker spawns inherit any tokens delivered via RPC or env.
+        let diffusers = DiffusersBackend::with_secrets(worker_script, python_bin, secrets.clone());
         pipeline.add_backend(Box::new(diffusers));
 
         Self {
             pipeline: Arc::new(pipeline),
+            secrets,
         }
     }
 }
@@ -47,6 +64,27 @@ impl Extension for ScryExtension {
 
     async fn handle_rpc(&self, method: &str, params: Value) -> Result<Value> {
         match method {
+            // ── omegon secret delivery ──
+            // Called once after get_tools handshake. Params is a flat object of
+            // {SECRET_NAME: "value"}. We stash these in the shared store; the
+            // diffusers worker picks them up at next spawn.
+            "bootstrap_secrets" => {
+                let mut count = 0usize;
+                let mut names: Vec<String> = Vec::new();
+                if let Some(obj) = params.as_object() {
+                    let mut store = self.secrets.lock().await;
+                    for (k, v) in obj {
+                        if let Some(s) = v.as_str() {
+                            store.insert(k.clone(), s.to_string());
+                            names.push(k.clone());
+                            count += 1;
+                        }
+                    }
+                }
+                info!(secrets = ?names, "bootstrap_secrets received");
+                Ok(serde_json::json!({"acknowledged": true, "received": count}))
+            }
+
             // ── v2 handshake ──
             "initialize" => {
                 Ok(serde_json::json!({
@@ -129,6 +167,7 @@ async fn main() {
     }
 
     let output_dir = resolve_dir("SCRY_OUTPUT_DIR", "output");
+    let artifacts_dir = resolve_dir("SCRY_ARTIFACTS_DIR", "artifacts");
 
     // Priority: SCRY_WORKER_SCRIPT env > relative to binary > cwd > ~/.scry/python/
     let worker_script = std::env::var("SCRY_WORKER_SCRIPT")
@@ -170,6 +209,7 @@ async fn main() {
     info!(
         scry_models = %scry_models_dir.display(),
         output_dir = %output_dir.display(),
+        artifacts_dir = %artifacts_dir.display(),
         worker_script = %worker_script.display(),
         python = %python_bin,
         "starting scry extension"
@@ -177,8 +217,38 @@ async fn main() {
 
     let _ = std::fs::create_dir_all(&scry_models_dir);
     let _ = std::fs::create_dir_all(&output_dir);
+    let _ = std::fs::create_dir_all(&artifacts_dir);
 
-    let ext = ScryExtension::new(extra_model_dirs, output_dir, worker_script, python_bin);
+    // Construct the shared secret store. In --rpc/omegon mode it stays empty
+    // until bootstrap_secrets arrives. In --mcp mode there is no parent that
+    // calls bootstrap_secrets, so seed from process env for known names.
+    let secrets: SecretStore = Arc::new(Mutex::new(HashMap::new()));
+    if matches!(mode, Some("--mcp")) {
+        let mut store = secrets.lock().await;
+        for name in KNOWN_SECRETS {
+            if let Ok(val) = std::env::var(name) {
+                if !val.is_empty() {
+                    info!(secret = name, "seeded secret from --mcp env fallback");
+                    store.insert((*name).to_string(), val);
+                }
+            }
+        }
+        if store.is_empty() {
+            warn!(
+                known = ?KNOWN_SECRETS,
+                "--mcp mode: no known secrets in env; gated downloads will fail"
+            );
+        }
+    }
+
+    let ext = ScryExtension::new(
+        extra_model_dirs,
+        output_dir,
+        artifacts_dir,
+        worker_script,
+        python_bin,
+        secrets,
+    );
 
     match ext.pipeline.scan_models().await {
         Ok(n) => info!(n, "models scanned"),
@@ -203,6 +273,7 @@ async fn main() {
             println!("  COMFYUI_URL         ComfyUI server URL (default: http://127.0.0.1:8188)");
             println!("  SCRY_MODELS_DIR     Model directory (default: ~/.scry/models)");
             println!("  SCRY_OUTPUT_DIR     Output directory (default: ~/.scry/output)");
+            println!("  SCRY_ARTIFACTS_DIR  Content-addressed artifact store (default: ~/.scry/artifacts)");
             return;
         }
         Some("--rpc") | _ => {

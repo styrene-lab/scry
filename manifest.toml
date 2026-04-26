@@ -12,6 +12,13 @@ binary = "target/release/scry"
 ping_method = "get_tools"
 timeout_ms = 10000
 
+[secrets]
+# Optional — scry works anonymously, but these unlock gated repos and higher rate limits.
+# Operators can configure via: omegon secret set HF_TOKEN <value>
+# In --mcp mode (no omegon parent), values are read from process env at startup.
+required = []
+optional = ["HF_TOKEN", "CIVITAI_TOKEN"]
+
 [widgets.gallery]
 label = "Gallery"
 kind = "stateful"

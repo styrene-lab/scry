@@ -79,6 +79,11 @@ pub struct GenerationResult {
     pub seed: i64,
     pub elapsed_ms: u64,
     pub model: String,
+    /// Content-addressed copies of `images`, populated by the Pipeline after a
+    /// backend returns. Empty if the pipeline didn't run (raw backend calls in
+    /// tests). Length matches `images` and is index-aligned.
+    #[serde(default)]
+    pub artifacts: Vec<crate::store::Artifact>,
 }
 
 fn default_width() -> u32 { 1024 }

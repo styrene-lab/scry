@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -13,6 +15,11 @@ use crate::backend::{Architecture, Backend, BackendStatus};
 use crate::params::{GenerateParams, GenerationResult, Img2ImgParams, UpscaleParams};
 use crate::{Error, Result};
 
+/// Shared secret store. Populated by the omegon `bootstrap_secrets` RPC (or seeded
+/// from process env in --mcp mode). Read at worker spawn time and injected as env
+/// vars on the worker subprocess only — never persisted, never echoed in logs.
+pub type SecretStore = Arc<Mutex<HashMap<String, String>>>;
+
 /// Backend that delegates to a long-running Python diffusers worker process.
 /// Communicates via line-delimited JSON over stdin/stdout.
 pub struct DiffusersBackend {
@@ -20,6 +27,7 @@ pub struct DiffusersBackend {
     python_bin: String,
     process: Mutex<Option<WorkerProcess>>,
     request_id: AtomicU64,
+    secrets: SecretStore,
 }
 
 struct WorkerProcess {
@@ -31,11 +39,16 @@ struct WorkerProcess {
 
 impl DiffusersBackend {
     pub fn new(worker_script: PathBuf, python_bin: String) -> Self {
+        Self::with_secrets(worker_script, python_bin, Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    pub fn with_secrets(worker_script: PathBuf, python_bin: String, secrets: SecretStore) -> Self {
         Self {
             worker_script,
             python_bin,
             process: Mutex::new(None),
             request_id: AtomicU64::new(1),
+            secrets,
         }
     }
 
@@ -51,13 +64,28 @@ impl DiffusersBackend {
             "spawning diffusers worker"
         );
 
-        let mut child = Command::new(&self.python_bin)
-            .arg("-u")
+        let mut cmd = Command::new(&self.python_bin);
+        cmd.arg("-u")
             .arg(&self.worker_script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+
+        // Inject secrets as env vars on the worker only. huggingface_hub reads
+        // HF_TOKEN automatically; CIVITAI_TOKEN is read by our search_models impl.
+        // Logged by name only — values never appear in stderr.
+        let secrets = self.secrets.lock().await;
+        if !secrets.is_empty() {
+            let names: Vec<&str> = secrets.keys().map(|s| s.as_str()).collect();
+            debug!(secrets = ?names, "injecting secrets into worker env");
+            for (k, v) in secrets.iter() {
+                cmd.env(k, v);
+            }
+        }
+        drop(secrets);
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| Error::BackendUnavailable(format!("failed to spawn python worker: {e}")))?;
 
@@ -113,23 +141,23 @@ impl DiffusersBackend {
             .map_err(|e| Error::GenerationFailed(format!("failed to serialize request: {e}")))?;
         request_line.push('\n');
 
-        worker
-            .stdin
-            .write_all(request_line.as_bytes())
-            .await
-            .map_err(|e| {
-                Error::BackendUnavailable(format!("failed to write to worker stdin: {e}"))
-            })?;
+        // If the cached worker died (e.g. crashed, oom-killed, or killed externally),
+        // its pipes are broken. Drop the stale handle so the next call respawns.
+        if let Err(e) = worker.stdin.write_all(request_line.as_bytes()).await {
+            *proc = None;
+            return Err(Error::BackendUnavailable(format!(
+                "failed to write to worker stdin: {e} (cached worker dropped; next call will respawn)"
+            )));
+        }
         worker.stdin.flush().await.ok();
 
         let mut response_line = String::new();
-        worker
-            .stdout
-            .read_line(&mut response_line)
-            .await
-            .map_err(|e| {
-                Error::BackendUnavailable(format!("failed to read from worker stdout: {e}"))
-            })?;
+        if let Err(e) = worker.stdout.read_line(&mut response_line).await {
+            *proc = None;
+            return Err(Error::BackendUnavailable(format!(
+                "failed to read from worker stdout: {e} (cached worker dropped; next call will respawn)"
+            )));
+        }
 
         if response_line.is_empty() {
             *proc = None;
@@ -184,6 +212,7 @@ impl DiffusersBackend {
             elapsed_ms: result.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0),
             model: model.to_string(),
             images,
+            artifacts: Vec::new(),
         })
     }
 }

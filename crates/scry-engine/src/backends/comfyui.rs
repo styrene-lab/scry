@@ -259,6 +259,7 @@ impl Backend for ComfyUiBackend {
             seed: params.seed,
             elapsed_ms,
             model: params.model.clone(),
+            artifacts: Vec::new(),
         })
     }
 

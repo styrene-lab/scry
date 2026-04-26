@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import sys
+import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -325,29 +328,240 @@ def handle_hf_search(params: dict) -> dict:
     return {"query": query, "count": len(results), "models": results}
 
 
-def handle_hf_download(params: dict) -> dict:
-    """Download a model from HuggingFace Hub."""
+class DownloadJob:
+    """One in-flight or completed HF download.
+
+    State is mutated from the download thread and read from the main (RPC) thread.
+    Atomic field assignments are sufficient — no compound updates.
+    """
+
+    def __init__(
+        self,
+        job_id: str,
+        repo_id: str,
+        filename: str | None,
+        dest_dir: str,
+        log_path: str,
+    ) -> None:
+        self.job_id = job_id
+        self.repo_id = repo_id
+        self.filename = filename
+        self.dest_dir = dest_dir
+        self.log_path = log_path
+        self.state = "pending"  # pending | downloading | complete | failed
+        self.started_at = time.time()
+        self.finished_at: float | None = None
+        self.bytes_total = 0
+        self.files_total = 0
+        self.bytes_done = 0
+        self.result_path: str | None = None
+        self.error: str | None = None
+
+    def snapshot(self) -> dict:
+        return {
+            "job_id": self.job_id,
+            "repo_id": self.repo_id,
+            "filename": self.filename,
+            "state": self.state,
+            "log_path": self.log_path,
+            "dest_dir": self.dest_dir,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "bytes_total": self.bytes_total,
+            "bytes_done": self.bytes_done,
+            "files_total": self.files_total,
+            "result_path": self.result_path,
+            "error": self.error,
+            "elapsed_s": (self.finished_at or time.time()) - self.started_at,
+        }
+
+
+_JOBS: dict[str, DownloadJob] = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _walk_dir_size(p: Path) -> int:
+    """Sum the size of every regular file under p. Skips symlinks (HF cache uses
+    symlinks from snapshots/ -> blobs/, so following them would double-count).
+    """
+    if not p.exists():
+        return 0
+    total = 0
+    for root, _dirs, files in os.walk(p, followlinks=False):
+        for name in files:
+            fp = Path(root) / name
+            try:
+                if not fp.is_symlink():
+                    total += fp.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _hf_cache_dir_for_repo(repo_id: str) -> Path:
+    """Where snapshot_download lands files when local_dir is None."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    return Path(HF_HUB_CACHE) / f"models--{repo_id.replace('/', '--')}"
+
+
+def _probe_repo_size(repo_id: str, filename: str | None) -> tuple[int, int]:
+    """Best-effort: return (bytes_total, files_total). Zero if probe fails."""
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().repo_info(repo_id, files_metadata=True)
+        siblings = info.siblings or []
+        if filename:
+            for s in siblings:
+                if s.rfilename == filename:
+                    return (s.size or 0, 1)
+            return (0, 1)
+        return (sum((s.size or 0) for s in siblings), len(siblings))
+    except Exception as e:  # noqa: BLE001 — probe is opportunistic
+        log(f"could not probe repo size for {repo_id}: {e}")
+        return (0, 0)
+
+
+def _run_download(job: DownloadJob) -> None:
+    """Download body — executed on a dedicated thread."""
     from huggingface_hub import hf_hub_download, snapshot_download
 
+    watch_dir = Path(job.dest_dir)
+    stop_watcher = threading.Event()
+
+    def watcher() -> None:
+        # Open in append mode so the header written below stays at the top.
+        with open(job.log_path, "a", buffering=1) as logf:
+            while not stop_watcher.wait(2.0):
+                done = _walk_dir_size(watch_dir)
+                job.bytes_done = done
+                if job.bytes_total > 0:
+                    pct = 100.0 * done / job.bytes_total
+                    logf.write(
+                        f"[{time.strftime('%H:%M:%S')}] {done:,} / {job.bytes_total:,} bytes ({pct:.1f}%)\n"
+                    )
+                else:
+                    logf.write(f"[{time.strftime('%H:%M:%S')}] {done:,} bytes\n")
+
+    watcher_thread = threading.Thread(
+        target=watcher, daemon=True, name=f"scry-watch-{job.job_id}"
+    )
+    watcher_thread.start()
+
+    try:
+        job.state = "downloading"
+        local_dir_arg = job.dest_dir if Path(job.dest_dir) != _hf_cache_dir_for_repo(job.repo_id) else None
+        if job.filename:
+            path = hf_hub_download(
+                repo_id=job.repo_id,
+                filename=job.filename,
+                local_dir=local_dir_arg,
+            )
+        else:
+            path = snapshot_download(
+                repo_id=job.repo_id,
+                local_dir=local_dir_arg,
+            )
+        job.result_path = str(path)
+        job.bytes_done = _walk_dir_size(watch_dir)
+        job.state = "complete"
+    except Exception as e:  # noqa: BLE001 — recorded on the job
+        job.error = f"{type(e).__name__}: {e}"
+        job.state = "failed"
+        with open(job.log_path, "a") as logf:
+            logf.write(f"\nERROR: {traceback.format_exc()}\n")
+    finally:
+        stop_watcher.set()
+        watcher_thread.join(timeout=3.0)
+        job.finished_at = time.time()
+        with open(job.log_path, "a") as logf:
+            logf.write(
+                f"\n# finished {time.strftime('%Y-%m-%d %H:%M:%S')} state={job.state}"
+            )
+            if job.result_path:
+                logf.write(f" path={job.result_path}")
+            if job.error:
+                logf.write(f" error={job.error}")
+            logf.write("\n")
+
+
+def handle_hf_download(params: dict) -> dict:
+    """Start a HuggingFace download in a background thread; return a job handle.
+
+    The download runs asynchronously — the caller polls `job_status` for progress
+    or tails `log_path` directly.
+    """
     repo_id = params["repo_id"]
     filename = params.get("filename")
     dest_dir = params.get("dest_dir")
 
-    log(f"downloading from HF: {repo_id}" + (f" file={filename}" if filename else " (full snapshot)"))
-
-    if filename:
-        path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            local_dir=dest_dir,
-        )
-        return {"downloaded": True, "path": str(path), "repo_id": repo_id, "filename": filename}
+    if dest_dir:
+        watch_dir = Path(dest_dir).expanduser()
     else:
-        path = snapshot_download(
-            repo_id=repo_id,
-            local_dir=dest_dir,
-        )
-        return {"downloaded": True, "path": str(path), "repo_id": repo_id}
+        watch_dir = _hf_cache_dir_for_repo(repo_id)
+
+    job_id = uuid.uuid4().hex[:8]
+    log_dir = Path("~/.cache/scry/downloads").expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{job_id}.log"
+
+    bytes_total, files_total = _probe_repo_size(repo_id, filename)
+
+    with open(log_path, "w", buffering=1) as logf:
+        logf.write(f"# scry download job {job_id}\n")
+        logf.write(f"# repo: {repo_id}\n")
+        if filename:
+            logf.write(f"# file: {filename}\n")
+        logf.write(f"# dest: {watch_dir}\n")
+        logf.write(f"# expected: {files_total} files, {bytes_total:,} bytes\n")
+        logf.write(f"# started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+    job = DownloadJob(
+        job_id=job_id,
+        repo_id=repo_id,
+        filename=filename,
+        dest_dir=str(watch_dir),
+        log_path=str(log_path),
+    )
+    job.bytes_total = bytes_total
+    job.files_total = files_total
+
+    with _JOBS_LOCK:
+        _JOBS[job_id] = job
+
+    thread = threading.Thread(
+        target=_run_download, args=(job,), daemon=True, name=f"scry-dl-{job_id}"
+    )
+    thread.start()
+
+    log(f"started download job {job_id}: {repo_id}" + (f" file={filename}" if filename else ""))
+
+    snap = job.snapshot()
+    snap["tip"] = (
+        f"Poll with download_status(job_id='{job_id}'), "
+        f"or run: tail -f {log_path}"
+    )
+    return snap
+
+
+def handle_job_status(params: dict) -> dict:
+    """Return live status for a download job. Recomputes bytes_done from disk."""
+    job_id = params.get("job_id")
+    if not job_id:
+        # No id given — return all known jobs.
+        with _JOBS_LOCK:
+            return {"jobs": [j.snapshot() for j in _JOBS.values()]}
+
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+    if job is None:
+        raise KeyError(f"unknown job_id: {job_id}")
+
+    # Refresh bytes_done on demand for in-flight jobs (cheap dir walk).
+    if job.state == "downloading":
+        job.bytes_done = _walk_dir_size(Path(job.dest_dir))
+    return job.snapshot()
 
 
 def handle_civitai_search(params: dict) -> dict:
@@ -413,6 +627,7 @@ HANDLERS = {
     "upscale": handle_upscale,
     "hf_search": handle_hf_search,
     "hf_download": handle_hf_download,
+    "job_status": handle_job_status,
     "civitai_search": handle_civitai_search,
 }
 

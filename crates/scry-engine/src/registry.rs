@@ -23,6 +23,7 @@ pub enum ModelKind {
 pub enum ModelFormat {
     Safetensors,
     Gguf,
+    Mlx,
     Ckpt,
     Bin,
 }
@@ -32,6 +33,7 @@ impl ModelFormat {
         match ext {
             "safetensors" => Some(Self::Safetensors),
             "gguf" => Some(Self::Gguf),
+            "npz" => Some(Self::Mlx),
             "ckpt" | "pth" => Some(Self::Ckpt),
             "bin" => Some(Self::Bin),
             _ => None,
@@ -305,37 +307,50 @@ impl ModelRegistry {
                 continue;
             }
 
-            // Check if this is a diffusers model (has model_index.json in a snapshot).
-            let is_diffusers = std::fs::read_dir(&snapshots_dir)
-                .ok()
-                .and_then(|mut entries| {
-                    entries.find_map(|e| {
-                        let e = e.ok()?;
-                        if e.path().join("model_index.json").exists() {
-                            Some(e.path())
-                        } else {
-                            None
-                        }
-                    })
-                });
+            // Pick the most recently modified snapshot — closest to "latest".
+            let Some(snapshot_path) = latest_snapshot(&snapshots_dir) else {
+                continue;
+            };
 
-            if let Some(snapshot_path) = is_diffusers {
-                let model = ModelEntry {
-                    name: hf_id.clone(),
-                    path: snapshot_path,
-                    kind: ModelKind::Checkpoint,
-                    format: ModelFormat::Safetensors,
-                    architecture: guess_architecture(&hf_id),
-                    size_bytes: 0, // Not meaningful for HF cache dirs.
-                    source: ModelSource::HuggingFace,
-                    tags: vec!["huggingface".to_string()],
-                    lora_metadata: None,
-                };
+            // Classify: diffusers (has model_index.json) vs mlx-community repo vs skip.
+            let is_diffusers = snapshot_path.join("model_index.json").exists();
+            let is_mlx = hf_id.starts_with("mlx-community/");
 
-                debug!(name = %model.name, "found HF cached model");
-                self.models.entry(hf_id).or_insert(model);
-                count += 1;
+            if !is_diffusers && !is_mlx {
+                continue;
             }
+
+            let format = if is_mlx { ModelFormat::Mlx } else { ModelFormat::Safetensors };
+            let mut tags = vec!["huggingface".to_string()];
+            if is_mlx {
+                tags.push("mlx".to_string());
+            }
+            if is_diffusers {
+                if let Err(reason) = verify_diffusers_snapshot(&snapshot_path) {
+                    tags.push("incomplete".to_string());
+                    tags.push(format!("missing:{reason}"));
+                    debug!(name = %hf_id, reason = %reason, "incomplete diffusers snapshot");
+                }
+            }
+            let architecture = detect_hf_architecture(&snapshot_path)
+                .or_else(|| guess_architecture(&hf_id));
+            let size_bytes = dir_size(&snapshot_path);
+
+            let model = ModelEntry {
+                name: hf_id.clone(),
+                path: snapshot_path,
+                kind: ModelKind::Checkpoint,
+                format,
+                architecture,
+                size_bytes,
+                source: ModelSource::HuggingFace,
+                tags,
+                lora_metadata: None,
+            };
+
+            debug!(name = %model.name, format = ?model.format, "found HF cached model");
+            self.models.entry(hf_id).or_insert(model);
+            count += 1;
         }
 
         count
@@ -458,6 +473,168 @@ fn find_a1111_roots() -> Vec<PathBuf> {
     }
 
     roots
+}
+
+/// Most-recently-modified snapshot directory under a HF repo's `snapshots/`.
+/// HF Hub may keep multiple snapshots (one per ref); mtime is the simplest "latest" signal.
+fn latest_snapshot(snapshots_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(snapshots_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+}
+
+/// Detect architecture from a HuggingFace diffusers snapshot's config files.
+/// More reliable than name-guessing for models with non-obvious names (e.g. sd-turbo).
+fn detect_hf_architecture(snapshot_path: &Path) -> Option<Architecture> {
+    let model_index = std::fs::read_to_string(snapshot_path.join("model_index.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&model_index).ok()?;
+    let class_name = json.get("_class_name")?.as_str()?;
+
+    match class_name {
+        "Flux2Pipeline" => Some(Architecture::Flux2),
+        "FluxPipeline" | "FluxImg2ImgPipeline" | "FluxInpaintPipeline" => Some(Architecture::Flux),
+        "StableDiffusion3Pipeline" | "StableDiffusion3Img2ImgPipeline" => Some(Architecture::Sd3),
+        s if s.starts_with("StableDiffusionXL") => Some(Architecture::Sdxl),
+        s if s.starts_with("StableDiffusion") => {
+            // Distinguish 1.x vs 2.x via UNet's cross_attention_dim (768 → 1.5, 1024 → 2.x).
+            let unet_cfg = std::fs::read_to_string(snapshot_path.join("unet/config.json")).ok()?;
+            let unet: serde_json::Value = serde_json::from_str(&unet_cfg).ok()?;
+            let dim = unet.get("cross_attention_dim").and_then(|v| v.as_u64())?;
+            Some(if dim >= 1024 { Architecture::Sd21 } else { Architecture::Sd15 })
+        }
+        _ => None,
+    }
+}
+
+/// Validate a diffusers snapshot has weight files for every component declared in
+/// `model_index.json`. Returns `Err(reason)` describing the first missing file/subfolder.
+///
+/// Required because `list_models` previously surfaced any directory containing a
+/// `model_index.json` — even when subsequent file downloads (UNet shards, VAE, text encoders)
+/// were missing — so callers got a successful list and a runtime crash at generate-time.
+fn verify_diffusers_snapshot(snapshot_path: &Path) -> std::result::Result<(), String> {
+    let model_index = std::fs::read_to_string(snapshot_path.join("model_index.json"))
+        .map_err(|e| format!("model_index.json: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&model_index)
+        .map_err(|e| format!("model_index.json parse: {e}"))?;
+    let obj = json.as_object().ok_or_else(|| "model_index.json not an object".to_string())?;
+
+    for (component, value) in obj {
+        // Underscore-prefixed entries (e.g. `_class_name`, `_diffusers_version`) are metadata.
+        if component.starts_with('_') {
+            continue;
+        }
+        // Components are declared as ["library", "ClassName"] tuples; anything else is metadata.
+        // Optional/inactive components serialize as [null, null] (e.g. `image_encoder` on a
+        // txt2img-only pipeline) and must be skipped — the snapshot is intentionally weight-less.
+        let Some(arr) = value.as_array() else {
+            continue;
+        };
+        if arr.len() != 2 {
+            continue;
+        }
+        let (Some(_library), Some(class)) = (arr[0].as_str(), arr[1].as_str()) else {
+            continue;
+        };
+        if !is_weight_component(component, class) {
+            continue;
+        }
+        let subdir = snapshot_path.join(component);
+        if !subdir.is_dir() {
+            return Err(format!("{component}/ subfolder"));
+        }
+        verify_component_weights(&subdir, component)?;
+    }
+    Ok(())
+}
+
+/// True for components that ship model weights (UNet, VAE, text encoders, transformers).
+/// Schedulers, tokenizers, feature extractors, and image processors are config-only.
+fn is_weight_component(component: &str, class: &str) -> bool {
+    if component == "scheduler"
+        || component.starts_with("tokenizer")
+        || component.starts_with("feature_extractor")
+        || component.starts_with("image_processor")
+    {
+        return false;
+    }
+    if class.contains("Tokenizer")
+        || class.contains("Scheduler")
+        || class.contains("FeatureExtractor")
+        || class.contains("ImageProcessor")
+    {
+        return false;
+    }
+    true
+}
+
+/// Verify a component subdirectory contains a complete weight set: either a single weight
+/// file, or a sharded index plus all referenced shards.
+fn verify_component_weights(subdir: &Path, component: &str) -> std::result::Result<(), String> {
+    const SINGLE_FILES: &[&str] = &[
+        "model.safetensors",
+        "diffusion_pytorch_model.safetensors",
+        "model.bin",
+        "pytorch_model.bin",
+        "diffusion_pytorch_model.bin",
+    ];
+    const INDEX_FILES: &[&str] = &[
+        "model.safetensors.index.json",
+        "diffusion_pytorch_model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+        "diffusion_pytorch_model.bin.index.json",
+    ];
+
+    for f in SINGLE_FILES {
+        if subdir.join(f).is_file() {
+            return Ok(());
+        }
+    }
+
+    for idx_name in INDEX_FILES {
+        let idx_path = subdir.join(idx_name);
+        if !idx_path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&idx_path)
+            .map_err(|e| format!("{component}/{idx_name}: {e}"))?;
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("{component}/{idx_name} parse: {e}"))?;
+        let weight_map = parsed
+            .get("weight_map")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| format!("{component}/{idx_name}: missing weight_map"))?;
+        let mut shards: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for v in weight_map.values() {
+            if let Some(s) = v.as_str() {
+                shards.insert(s);
+            }
+        }
+        for shard in shards {
+            if !subdir.join(shard).is_file() {
+                return Err(format!("{component}/{shard}"));
+            }
+        }
+        return Ok(());
+    }
+
+    Err(format!("{component}/ has no weight file"))
+}
+
+/// Sum the file sizes inside a directory, following symlinks.
+/// HuggingFace snapshots are full of symlinks into the blob store, so we need to follow them.
+fn dir_size(path: &Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| std::fs::metadata(e.path()).ok())
+        .map(|m| m.len())
+        .sum()
 }
 
 fn guess_architecture(name: &str) -> Option<Architecture> {

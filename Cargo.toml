@@ -19,4 +19,6 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
+base64 = "0.22"
+sha2 = "0.10"
 omegon-extension = "0.17.0-rc.1"

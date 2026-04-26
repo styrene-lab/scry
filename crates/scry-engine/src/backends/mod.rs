@@ -2,4 +2,4 @@ mod comfyui;
 mod diffusers;
 
 pub use comfyui::ComfyUiBackend;
-pub use diffusers::DiffusersBackend;
+pub use diffusers::{DiffusersBackend, SecretStore};
