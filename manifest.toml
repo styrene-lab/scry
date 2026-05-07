@@ -37,5 +37,45 @@ kind = "stateful"
 renderer = "table"
 description = "Local model catalog — checkpoints, LoRAs, VAEs"
 
+[config.models_dir]
+type = "string"
+label = "Models directory"
+description = "Path to local model checkpoints, LoRAs, and VAEs"
+required = false
+placeholder = "~/.scry/models"
+
+[config.output_dir]
+type = "string"
+label = "Output directory"
+description = "Where generated images are saved"
+required = false
+placeholder = "~/.scry/output"
+
+[config.comfyui_url]
+type = "string"
+label = "ComfyUI server URL"
+description = "HTTP endpoint for ComfyUI backend (leave empty to skip)"
+required = false
+placeholder = "http://127.0.0.1:8188"
+
+[config.python_bin]
+type = "string"
+label = "Python binary"
+description = "Path to Python interpreter for the diffusers backend"
+required = false
+default = "python3"
+
+[config.default_steps]
+type = "number"
+label = "Default inference steps"
+required = false
+default = "30"
+
+[config.default_guidance]
+type = "number"
+label = "Default guidance scale"
+required = false
+default = "7.5"
+
 [mind]
 enabled = false
