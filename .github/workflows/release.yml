@@ -1,0 +1,143 @@
+name: release
+
+# Standard release workflow for omegon extensions.
+#
+# Trigger: push a `v*` tag (e.g. `v0.1.0`). Cross-compiles the
+# extension on Linux + macOS, packages each platform's binary as a
+# tar.gz, and uploads everything to a GitHub Release.
+#
+# omegon's name-only install path (`omegon extension install <name>`)
+# looks for GitHub Release artifacts named
+# `<name>-<version>-<target>.tar.gz`. Once the release exists, the
+# install becomes a one-line `omegon extension install <name>` instead
+# of the explicit git URL form.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (must exist on origin)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            zigbuild: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            zigbuild: true
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: aarch64-apple-darwin
+            os: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig (for cross-compiling aarch64 Linux)
+        if: matrix.zigbuild
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        if: matrix.zigbuild
+        run: cargo install cargo-zigbuild
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.zigbuild }}" = "true" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        # Tar all relevant executables from target/<target>/release/.
+        # We grep out cargo's build metadata (.d, .rlib, build/, deps/, etc.)
+        # and ship only the actual binaries.
+        run: |
+          mkdir -p dist
+          REPO=$(basename "$GITHUB_REPOSITORY")
+          TAG="${RELEASE_TAG#v}"
+          STAGE="$(mktemp -d)/$REPO-$TAG-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          # Copy executables (anything in target/<target>/release/ that
+          # isn't a build-cache artifact).
+          for f in target/${{ matrix.target }}/release/*; do
+            base=$(basename "$f")
+            case "$base" in
+              *.d|*.rlib|*.so|*.dylib|deps|build|incremental|examples|.*) continue ;;
+            esac
+            [ -d "$f" ] && continue
+            [ -x "$f" ] && cp "$f" "$STAGE/"
+          done
+          # Include manifest.toml so install scripts can read runtime.binary
+          # without needing to clone the source repo.
+          cp manifest.toml "$STAGE/" 2>/dev/null || true
+          tar czf "dist/$REPO-$TAG-${{ matrix.target }}.tar.gz" -C "$(dirname "$STAGE")" "$(basename "$STAGE")"
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Compute checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > checksums.sha256
+          cat checksums.sha256
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Idempotent — re-running on the same tag updates the release.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --generate-notes \
+              dist/*
+          fi

@@ -1,0 +1,87 @@
+name: ci
+
+# Standard CI for omegon extensions. Two responsibilities:
+#
+# 1. Build + test on every push/PR — make sure the extension compiles
+#    and its own tests pass.
+# 2. SDK compatibility smoke — spawn the built binary and verify it
+#    speaks the omegon-extension v2 wire protocol correctly. Catches
+#    drift between this extension and the SDK version it links against.
+#
+# The smoke step reads `runtime.binary` from manifest.toml so the same
+# workflow works across every extension without per-repo customization.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Resolve extension binary path
+        id: bin
+        # Pull `runtime.binary` out of manifest.toml so the smoke step
+        # below doesn't need to be customized per-extension.
+        run: |
+          BIN=$(grep -E '^binary = ' manifest.toml | head -n1 | sed -E 's/^binary = "(.*)"/\1/')
+          if [ -z "$BIN" ]; then
+            echo "::error::could not parse runtime.binary from manifest.toml"
+            exit 1
+          fi
+          # Strip leading "target/release/" if present — we want the
+          # plain executable name to run from the workspace root.
+          test -x "$BIN" || BIN=$(echo "$BIN" | sed 's|^target/release/||')
+          test -x "target/release/$BIN" || { echo "::error::binary 'target/release/$BIN' not found after build"; ls target/release/ | head; exit 1; }
+          NAME=$(grep -E '^name = ' manifest.toml | head -n1 | sed -E 's/^name = "(.*)"/\1/')
+          echo "binary=target/release/$BIN" >> "$GITHUB_OUTPUT"
+          echo "extension_name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests
+        # Run anything in `tests/unit*` and the inline `#[test]`s in src.
+        # Integration tests that need external services (sshd, S3, etc.)
+        # should live in `tests/integration*` and run via separate CI.
+        run: |
+          if ls tests/unit*.rs >/dev/null 2>&1; then
+            cargo test --test 'unit*'
+          else
+            cargo test --lib
+          fi
+
+      - name: SDK compatibility smoke
+        # Confirm the binary's `initialize` reply matches the v2
+        # contract from omegon-extension. If the SDK changes shape
+        # in a way this extension doesn't keep up with, fail here
+        # before any release ships.
+        run: |
+          BIN="${{ steps.bin.outputs.binary }}"
+          NAME="${{ steps.bin.outputs.extension_name }}"
+          RESP=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | "$BIN" --rpc 2>/dev/null | head -n1)
+          echo "Response: $RESP"
+          test -n "$RESP" || { echo "::error::no response from binary"; exit 1; }
+          echo "$RESP" | grep -q '"jsonrpc":"2.0"' || { echo "::error::not a JSON-RPC 2.0 response"; exit 1; }
+          echo "$RESP" | grep -q '"protocol_version":2' || { echo "::error::missing protocol_version=2 in initialize"; exit 1; }
+          echo "$RESP" | grep -q "\"name\":\"$NAME\"" || { echo "::error::extension_info.name must equal '$NAME' (per manifest)"; exit 1; }
+          echo "SDK contract OK"
