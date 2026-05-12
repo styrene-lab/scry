@@ -39,7 +39,12 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build (release)
-        run: cargo build --release
+        # `--workspace` covers extensions that split the omegon adapter
+        # into its own crate (flynt, scry, vox).
+        # `--all-features` covers extensions that gate the adapter behind
+        # a feature flag in a single crate (lipstyk's `agent` feature).
+        # Shuttle has neither pattern so this is a harmless superset there.
+        run: cargo build --release --workspace --all-features
 
       - name: Resolve extension binary path
         id: bin

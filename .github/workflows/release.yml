@@ -68,10 +68,14 @@ jobs:
 
       - name: Build
         run: |
+          # `--workspace --all-features` ensures we pick up both the
+          # standalone application and the omegon-extension adapter for
+          # extensions that split them apart (lipstyk's feature-gated
+          # `lipstyk-agent`, flynt's separate `flynt-agent` crate, etc.).
           if [ "${{ matrix.zigbuild }}" = "true" ]; then
-            cargo zigbuild --release --target ${{ matrix.target }}
+            cargo zigbuild --release --workspace --all-features --target ${{ matrix.target }}
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --workspace --all-features --target ${{ matrix.target }}
           fi
 
       - name: Package
