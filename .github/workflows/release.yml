@@ -35,17 +35,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # aarch64-unknown-linux-gnu intentionally excluded: many
-        # extensions depend on `openssl-sys` (transitively via reqwest
-        # / oauth flows), which needs a cross-compiled openssl sysroot
-        # that zigbuild can't provide out of the box. ARM Linux
-        # operators can install from source until we either ship
-        # a `cross`-based job or migrate the affected extensions to
-        # rustls.
+        # All four extensions are openssl-free (reqwest rustls-tls),
+        # so cargo-zigbuild can cross-compile aarch64 Linux without
+        # a custom sysroot.
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             zigbuild: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            zigbuild: true
           - target: x86_64-apple-darwin
             os: macos-14
           - target: aarch64-apple-darwin
